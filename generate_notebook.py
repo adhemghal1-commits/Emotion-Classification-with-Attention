@@ -1,0 +1,369 @@
+import json
+
+notebook = {
+    "cells": [
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "# Emotion Classification with Attention Mechanisms\n",
+                "### Multi-Class Text Emotion Detection across 6 Core Emotions\n",
+                "\n",
+                "**Objective:**\n",
+                "Build and benchmark sequence models with attention mechanisms against a fine-tuned transformer (DistilBERT) for multi-class emotion classification across **6 core emotions**:\n",
+                "1. **Joy**\n",
+                "2. **Sadness**\n",
+                "3. **Anger**\n",
+                "4. **Fear**\n",
+                "5. **Surprise**\n",
+                "6. **Disgust**\n",
+                "\n",
+                "---\n",
+                "### Architectures Compared:\n",
+                "1. **LSTM** (with pre-trained GloVe 100d embeddings)\n",
+                "2. **GRU** (with pre-trained GloVe 100d embeddings)\n",
+                "3. **BiLSTM + Attention** (with pre-trained GloVe 100d embeddings and Bahdanau attention weight extraction)\n",
+                "4. **Fine-Tuned DistilBERT** (Hugging Face Trainer API)\n",
+                "\n",
+                "---\n",
+                "### Interpretability:\n",
+                "We extract dynamic attention weights from the BiLSTM + Attention model to generate **token-level attention heatmaps** explaining the exact words driving each emotional classification."
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 1. Environment Setup & Imports"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "import os\n",
+                "import re\n",
+                "import json\n",
+                "import numpy as np\n",
+                "import pandas as pd\n",
+                "import matplotlib.pyplot as plt\n",
+                "import seaborn as sns\n",
+                "\n",
+                "import torch\n",
+                "import torch.nn as nn\n",
+                "import torch.nn.functional as F\n",
+                "from torch.utils.data import Dataset, DataLoader\n",
+                "from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score\n",
+                "\n",
+                "from src.dataset import (\n",
+                "    EMOTIONS,\n",
+                "    EMOTION_TO_ID,\n",
+                "    ID_TO_EMOTION,\n",
+                "    clean_text,\n",
+                "    prepare_goemotions_df,\n",
+                "    Vocabulary,\n",
+                "    load_glove_matrix,\n",
+                "    EmotionDataset\n",
+                ")\n",
+                "from src.models import LSTMClassifier, GRUClassifier, BiLSTMAttentionClassifier\n",
+                "from src.train import train_model\n",
+                "from src.evaluate import evaluate_pytorch_model\n",
+                "from src.visualize import plot_attention_heatmap, plot_confusion_matrix, plot_model_comparisons\n",
+                "\n",
+                "device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')\n",
+                "print(f'Device in use: {device}')"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 2. Load & Explore GoEmotions Dataset (Ekman 6 Core Mapping)\n",
+                "\n",
+                "The GoEmotions dataset (Google Research) consists of Reddit comments annotated with 27 emotions + neutral.\n",
+                "We map these 28 classes into **Paul Ekman's 6 basic core emotions**:\n",
+                "- **Joy:** *admiration, amusement, approval, excitement, gratitude, joy, love, optimism, pride, relief*\n",
+                "- **Sadness:** *disappointment, embarrassment, grief, remorse, sadness*\n",
+                "- **Anger:** *anger, annoyance, disapproval*\n",
+                "- **Fear:** *fear, nervousness*\n",
+                "- **Surprise:** *confusion, curiosity, realization, surprise*\n",
+                "- **Disgust:** *disgust*"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "train_df = prepare_goemotions_df('Simplified/train-00000-of-00001.parquet', use_ekman=True)\n",
+                "val_df = prepare_goemotions_df('Simplified/validation-00000-of-00001.parquet', use_ekman=True)\n",
+                "test_df = prepare_goemotions_df('Simplified/test-00000-of-00001.parquet', use_ekman=True)\n",
+                "\n",
+                "print(f'Train samples: {len(train_df):,}')\n",
+                "print(f'Validation samples: {len(val_df):,}')\n",
+                "print(f'Test samples: {len(test_df):,}')\n",
+                "\n",
+                "train_df.head(10)"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# Visualize Emotion Class Distribution\n",
+                "plt.figure(figsize=(8, 4), dpi=120)\n",
+                "order = train_df['emotion'].value_counts().index\n",
+                "sns.countplot(data=train_df, x='emotion', order=order, palette='viridis')\n",
+                "plt.title('Emotion Distribution in Training Set (Mapped Ekman Classes)', fontsize=12, fontweight='bold')\n",
+                "plt.xlabel('Emotion Class')\n",
+                "plt.ylabel('Count')\n",
+                "plt.grid(axis='y', linestyle='--', alpha=0.5)\n",
+                "plt.tight_layout()\n",
+                "plt.show()"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 3. Tokenization & Pre-Trained GloVe Word Embeddings\n",
+                "\n",
+                "We tokenize the cleaned texts, build a vocabulary with special tokens `<pad>` (index 0) and `<unk>` (index 1), and load **GloVe 100-dimensional pre-trained embeddings** to initialize the embedding layers."
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "vocab = Vocabulary()\n",
+                "vocab.build_vocab(train_df['clean_text'].tolist(), min_freq=2)\n",
+                "print(f'Vocabulary size: {len(vocab):,} unique tokens')\n",
+                "\n",
+                "# Load GloVe 100d weights matrix\n",
+                "embedding_matrix = load_glove_matrix(vocab, embedding_dim=100)\n",
+                "print(f'Embedding matrix shape: {embedding_matrix.shape}')"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# PyTorch DataLoaders\n",
+                "max_len = 50\n",
+                "batch_size = 64\n",
+                "\n",
+                "train_dataset = EmotionDataset(train_df['clean_text'], train_df['label'], vocab, max_len=max_len)\n",
+                "val_dataset = EmotionDataset(val_df['clean_text'], val_df['label'], vocab, max_len=max_len)\n",
+                "test_dataset = EmotionDataset(test_df['clean_text'], test_df['label'], vocab, max_len=max_len)\n",
+                "\n",
+                "train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)\n",
+                "val_loader = DataLoader(val_dataset, batch_size=batch_size * 2, shuffle=False)\n",
+                "test_loader = DataLoader(test_dataset, batch_size=batch_size * 2, shuffle=False)\n",
+                "print(f'Train batches: {len(train_loader)}, Val batches: {len(val_loader)}, Test batches: {len(test_loader)}')"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 4. Sequence Model Architectures with Attention\n",
+                "\n",
+                "### Mathematical Formulation of Bahdanau Attention:\n",
+                "Given hidden states $H = [h_1, h_2, \\dots, h_T] \\in \\mathbb{R}^{T \\times 2D}$ from the Bidirectional LSTM:\n",
+                "1. **Energy Scoring:** $u_t = \\tanh(W_a h_t + b_a)$ where $W_a \\in \\mathbb{R}^{A \\times 2D}$\n",
+                "2. **Attention Weights:** $\\alpha_t = \\frac{\\exp(v_a^\\top u_t)}{\\sum_{k=1}^T \\exp(v_a^\\top u_k)}$ with padding masked\n",
+                "3. **Context Vector:** $c = \\sum_{t=1}^T \\alpha_t h_t \\in \\mathbb{R}^{2D}$\n",
+                "4. **Classification:** $\\hat{y} = \\text{softmax}(W_c c + b_c)$"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# Inspect model architecture\n",
+                "bilstm_sample = BiLSTMAttentionClassifier(\n",
+                "    vocab_size=len(vocab),\n",
+                "    embedding_dim=100,\n",
+                "    hidden_dim=128,\n",
+                "    num_layers=2,\n",
+                "    num_classes=6,\n",
+                "    attention_dim=128,\n",
+                "    weights_matrix=embedding_matrix\n",
+                ")\n",
+                "print(bilstm_sample)"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 5. Model Benchmark & Comparative Evaluation\n",
+                "\n",
+                "We evaluate all four architectures on the unseen test set:\n",
+                "- **LSTM**\n",
+                "- **GRU**\n",
+                "- **BiLSTM + Attention**\n",
+                "- **Fine-Tuned DistilBERT**"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "if os.path.exists('results/model_comparison.csv'):\n",
+                "    comparison_df = pd.read_csv('results/model_comparison.csv')\n",
+                "    print('Architecture Comparison:')\n",
+                "    print(comparison_df.to_string(index=False))\n",
+                "    \n",
+                "    # Plot performance comparison\n",
+                "    plot_model_comparisons(comparison_df)\n",
+                "    plt.show()\n",
+                "else:\n",
+                "    print('Run train_all_and_compare.py to generate full comparison benchmark.')"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# Display Confusion Matrices\n",
+                "from PIL import Image\n",
+                "\n",
+                "fig, axes = plt.subplots(2, 2, figsize=(14, 12), dpi=130)\n",
+                "model_cm_files = [\n",
+                "    ('LSTM', 'results/confusion_matrix_lstm.png'),\n",
+                "    ('GRU', 'results/confusion_matrix_gru.png'),\n",
+                "    ('BiLSTM + Attention', 'results/confusion_matrix_bilstm___attention.png'),\n",
+                "    ('Fine-Tuned DistilBERT', 'results/confusion_matrix_fine_tuned_distilbert.png')\n",
+                "]\n",
+                "\n",
+                "for idx, (title, path) in enumerate(model_cm_files):\n",
+                "    ax = axes[idx // 2, idx % 2]\n",
+                "    if os.path.exists(path):\n",
+                "        img = Image.open(path)\n",
+                "        ax.imshow(img)\n",
+                "        ax.axis('off')\n",
+                "    else:\n",
+                "        ax.text(0.5, 0.5, f'{title}\\n(Check results folder)', ha='center', va='center')\n",
+                "        ax.axis('off')\n",
+                "\n",
+                "plt.tight_layout()\n",
+                "plt.show()"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 6. Attention Heatmap Visualizations & Token Interpretability\n",
+                "\n",
+                "Here we visualize the token-level attention distribution for sample sentences across each emotion class.\n",
+                "Notice how the model concentrates attention weight directly on emotional anchor words."
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# Load trained BiLSTM + Attention model\n",
+                "attn_model = BiLSTMAttentionClassifier(\n",
+                "    vocab_size=len(vocab),\n",
+                "    embedding_dim=100,\n",
+                "    hidden_dim=128,\n",
+                "    num_layers=2,\n",
+                "    num_classes=6\n",
+                ")\n",
+                "if os.path.exists('saved_models/bilstm_attention.pt'):\n",
+                "    attn_model.load_state_dict(torch.load('saved_models/bilstm_attention.pt', map_location=device))\n",
+                "    attn_model.to(device)\n",
+                "    attn_model.eval()\n",
+                "\n",
+                "def predict_and_explain(text):\n",
+                "    clean = clean_text(text)\n",
+                "    ids, length, tokens = vocab.encode(clean, max_len=50)\n",
+                "    inp = torch.tensor([ids], dtype=torch.long).to(device)\n",
+                "    with torch.no_grad():\n",
+                "        logits, weights = attn_model(inp, return_attention=True)\n",
+                "        probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()\n",
+                "        pred_id = int(np.argmax(probs))\n",
+                "        pred_emo = ID_TO_EMOTION[pred_id]\n",
+                "        conf = float(probs[pred_id])\n",
+                "        token_weights = weights[0].cpu().numpy()[:length]\n",
+                "    \n",
+                "    fig = plot_attention_heatmap(tokens, token_weights, pred_label=pred_emo, confidence=conf)\n",
+                "    plt.show()\n",
+                "    return pred_emo, conf\n",
+                "\n",
+                "# Test samples\n",
+                "predict_and_explain('I am so overjoyed and thrilled by this fantastic news!')\n",
+                "predict_and_explain('I feel completely empty and broken hearted.')\n",
+                "predict_and_explain('This is totally infuriating and ridiculous.')\n",
+                "predict_and_explain('I am terrified of being abandoned alone.')\n",
+                "predict_and_explain('Wait what? I was completely shocked and never expected that.')\n",
+                "predict_and_explain('The rotting mold on that bread was utterly repulsive and sickening.')"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 7. Interactive Custom Inference\n",
+                "\n",
+                "Try entering any sentence to predict the dominant emotion and view confidence across all 6 core emotions:"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "custom_sentence = 'I love working on deep learning projects, it is so much fun!'\n",
+                "pred, conf = predict_and_explain(custom_sentence)\n",
+                "print(f\"Input: '{custom_sentence}'\")\n",
+                "print(f'Dominant Emotion: {pred.upper()} ({conf:.1%})')"
+            ]
+        }
+    ],
+    "metadata": {
+        "kernelspec": {
+            "display_name": "Python 3",
+            "language": "python",
+            "name": "python3"
+        },
+        "language_info": {
+            "codemirror_mode": {"name": "ipython", "version": 3},
+            "file_extension": ".py",
+            "mimetype": "text/x-python",
+            "name": "python",
+            "nbconvert_exporter": "python",
+            "pygments_lexer": "ipython3",
+            "version": "3.13.3"
+        }
+    },
+    "nbformat": 4,
+    "nbformat_minor": 2
+}
+
+with open("emotion_classification_with_attention.ipynb", "w", encoding="utf-8") as f:
+    json.dump(notebook, f, indent=2)
+
+print("Generated emotion_classification_with_attention.ipynb successfully.")
+
